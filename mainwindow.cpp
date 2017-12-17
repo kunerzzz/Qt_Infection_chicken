@@ -5,6 +5,8 @@
 #include <QFile>
 #include <QDataStream>
 #include <QDate>
+#include <QTime>
+#include <QApplication>
 
 #define LEFTBORDER 50
 #define TOPBORDER 50
@@ -16,14 +18,18 @@ int SelectX=-1,SelectY=-1;
 int GridInfo[7][7];
 int SelectStep=0;
 int turn=0;
-int GameMode=0;//0--初始；1--PVP；2--PVE Black；3--PVE White
+int GameMode=0;//0--初始；1--PVP；2--PVE Black；3--PVE White；4--PvP Network；5--尝试连接
 int bestStartX,bestStartY,bestEndX,bestEndY;
+bool needWarning=1;
+bool needWaiting=0;
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
     this->setWindowTitle("同化鸡");
     setWindowIcon(QIcon(QStringLiteral(":/images/chicken_64X64.ico")));
+    Color=0;
+    roomNumber=0;
     empty=new QImage;
     emptyGreen=new QImage;
     emptyYellow=new QImage;
@@ -82,8 +88,19 @@ MainWindow::MainWindow(QWidget *parent)
     GameInfo2->setAlignment(Qt::AlignCenter);
     GameInfo2->setText("KunerStudio");
 
-    tm=new QTimer;
+    tm=new QTimer(this);
     connect(tm,SIGNAL(timeout()),this,SLOT(tmTimeout()));
+    connectTimer=new QTimer(this);
+    connect(connectTimer,SIGNAL(timeout()),this,SLOT(connectTimeOut()));
+
+    serverIP=new QHostAddress;
+    port=2333;
+    //serverIP->setAddress("128.199.82.227");
+    serverIP->setAddress("159.89.243.21");
+    tcpSocket=new QTcpSocket(this);
+    connect(tcpSocket,SIGNAL(connected()),this,SLOT(slotConnect()));
+    connect(tcpSocket,SIGNAL(disconnected()),this,SLOT(slotDisconnect()));
+    connect(tcpSocket,SIGNAL(readyRead()),this,SLOT(dataReceived()));
 
     PvPStart->setGeometry(900,530,200,80);
     PvPStart->setText("新的PVP对局");
@@ -122,13 +139,16 @@ void MainWindow::GameHelp()
                                  "棋子落下后，将使相邻八个位置内的对手棋子变成己方棋子。\n"
                                  "一方无法落子时，跳过该回合，双方均无法落子时，游戏结束，棋子数量多者胜。\n\n注：程序将自动保存棋局信息，除非你删除了名为\"Record.chicken\"的文件\n"
                                  "\n"
-                                 "人机模式说明：\n"
-                                 "红框标注的棋子和空位为AI本回合着法\n\n"
-                                 "注意：最高难度可能会造成程序卡顿，请耐心等待AI运算\n"
+                                 "人机和联网对局说明：\n"
+                                 "红框标注的棋子和空位为对手本回合着法\n\n"
+                                 "注意：人机最高难度可能会造成程序卡顿，请耐心等待AI运算\n"
+                                 "\n"
+                                 "联网对局中，先进入房间者执黑\n"
                                  "\n"
                                  "Made by KunerStudio\n"
                                  "Powered by Qt"));
 }
+
 void MainWindow::RecordLoad()
 {
     QFile Record("Record.chicken");
@@ -176,6 +196,7 @@ void MainWindow::RecordSave()
             out<<GridInfo[i][j];
     Record.close();
 }
+
 bool InGrid(int x,int y)
 {
     return x>=0&&x<7*INTERVAL&&y>=0&&y<7*INTERVAL&&x%INTERVAL<=100&&y%INTERVAL<=100;
@@ -196,6 +217,7 @@ void ProcStep(int startX,int startY,int endX,int endY)
             if(inMap(endX+i,endY+j)&&GridInfo[endX+i][endY+j])
                 GridInfo[endX+i][endY+j]=turn;
 }
+
 bool dfsProcStep(int startX,int startY,int endX,int endY,int currBotColor,int tempBoard[7][7])
 {
     if(tempBoard[endX][endY])
@@ -209,6 +231,7 @@ bool dfsProcStep(int startX,int startY,int endX,int endY,int currBotColor,int te
         tempBoard[startX][startY]=0;
     return 1;
 }
+
 int Onetry(int currBotColor,int lastBoard[7][7],int depth,int alpha)
 {
     int beta=99999;
@@ -276,6 +299,7 @@ int Onetry(int currBotColor,int lastBoard[7][7],int depth,int alpha)
     }
     return -MinValue;
 }
+
 void MainWindow::AIturn()
 {
     QString temp=GameInfo1->text();
@@ -290,8 +314,9 @@ void MainWindow::AIturn()
     if(turn==-1)
         point[SelectX][SelectY]->setPixmap(QPixmap::fromImage(*AIWhite));
         point[bestEndX][bestEndY]->setPixmap(QPixmap::fromImage(*AITarget));
-    tm->start(800);
+    tm->start(500);
 }
+
 void MainWindow::tmTimeout()
 {
     tm->stop();
@@ -299,11 +324,14 @@ void MainWindow::tmTimeout()
     SelectY=-1;
     ProcStep(bestStartX,bestStartY,bestEndX,bestEndY);
     GridDisplay();
+    needWaiting=false;
     GameCore();
 }
+
 void MainWindow::GameCore()
 {
-    MainWindow::RecordSave();
+    if(GameMode!=4)
+        MainWindow::RecordSave();
     bool BlackAva=0,WhiteAva=0;
     int Black=0,White=0;
     int i,j;
@@ -329,6 +357,7 @@ void MainWindow::GameCore()
             }
     blackNum->setText(QString::number(Black));
     whiteNum->setText(QString::number(White));
+    if(GameMode!=4){
     if(!BlackAva)
     {
         turn=0;
@@ -353,17 +382,31 @@ void MainWindow::GameCore()
         QFile::remove("Record.chicken");
         return;
     }
+    }
     turn=-turn;
-    if(turn==1)
-        GameInfo1->setText("黑方行棋");
-    if(turn==-1)
-        GameInfo1->setText("白方行棋");
+    if(GameMode==4)
+    {
+        if(turn==Color)
+            GameInfo1->setText("你的回合");
+        else
+            GameInfo1->setText("对手回合");
+    }
+    else
+    {
+        if(turn==1)
+            GameInfo1->setText("黑方行棋");
+        if(turn==-1)
+            GameInfo1->setText("白方行棋");
+    }
     if((GameMode==2&&turn==-1)||(GameMode==3&&turn==1))
     {
         SelectStep=0;
         AIturn();
     }
+    else if(GameMode==4&&turn!=Color)
+        SelectStep=0;
     else SelectStep=1;
+    return;
 }
 
 void MainWindow::PvP()
@@ -372,29 +415,247 @@ void MainWindow::PvP()
             QMessageBox::warning(this,tr("警告"),tr("开始新的对局将使当前棋局丢失，确定吗？"),
                                  QMessageBox::Ok|QMessageBox::Cancel,QMessageBox::Cancel)==QMessageBox::Ok)
     {
+        if(GameMode==4)
+        {
+            needWarning=false;
+            tcpSocket->disconnectFromHost();
+            GameInfo1->setText("对局终止");
+        }
+        GameMode=0;
+        SelectStep=0;
+        turn=0;
+        SelectX=SelectY=-1;
         QFile::remove("Record.chicken");
-        GameMode=1;
-        SelectStep=1;
-        turn=1;
         for(int i=0;i<7;i++)
             for(int j=0;j<7;j++)
                 GridInfo[i][j]=0;
-        GridInfo[0][0]=GridInfo[6][6]=1;
-        GridInfo[0][6]=GridInfo[6][0]=-1;
-        blackNum->setText("2");
-        whiteNum->setText("2");
-        GameInfo1->setText("黑方行棋");
-        GameInfo2->setText("PvP");
         GridDisplay();
+        blackNum->setText("0");
+        whiteNum->setText("0");
+        GameInfo1->setText("同化鸡");
+        GameInfo2->setText("KunerStudio");
+        bool ok;
+        roomNumber=QInputDialog::getInt(this,
+                                    tr("联网对局"),tr("请输入房间号(联网:1-255,本地:0):"),
+                                                  0,0,255,1,&ok);
+        if(!ok)
+            return;
+        QFile::remove("Record.chicken");
+        if(roomNumber==0)
+        {
+            GameMode=1;
+            SelectStep=1;
+            turn=1;
+            GridInfo[0][0]=GridInfo[6][6]=1;
+            GridInfo[0][6]=GridInfo[6][0]=-1;
+            blackNum->setText("2");
+            whiteNum->setText("2");
+            GameInfo1->setText("黑方行棋");
+            GameInfo2->setText("PvP 本地");
+            GridDisplay();
+        }
+        else
+        {
+            GameMode=5;
+            PvPStart->setEnabled(false);
+            PvEStart->setEnabled(false);
+            tcpSocket->connectToHost(*serverIP,port);
+            connectTimer->start(3500);
+            GameInfo1->setText(tr("尝试连接..."));
+        }
     }
 }
+
+void MainWindow::connectTimeOut()
+{
+    connectTimer->stop();
+    QMessageBox::information(this,tr("连接失败"),tr("连接服务器失败，请检查网络连接或联系服务器管理员"));
+    GameInfo1->setText(tr("同化鸡"));
+    GameInfo2->setText(tr("KunerStudio"));
+    PvPStart->setEnabled(true);
+    PvEStart->setEnabled(true);
+    GameMode=0;
+}
+
+void MainWindow::slotConnect()
+{
+    connectTimer->stop();
+    GameMode=4;
+    PvPStart->setEnabled(true);
+    PvEStart->setEnabled(true);
+    char *msg;
+    msg=new char;
+    *msg=roomNumber;
+    tcpSocket->write(msg,1);
+}
+
+void MainWindow::dataReceived()
+{
+    while(tcpSocket->bytesAvailable()>0){
+    if(Color)
+    {
+        char msg[4];
+        tcpSocket->read(msg,4);
+        //GameInfo1->setText(QString::number((int)msg[0])+" "+QString::number((int)msg[1])+" "+QString::number((int)msg[2])+" "+QString::number((int)msg[3]));
+        if(msg[0]==10)
+        {
+            QMessageBox::information(this,"对方断线","对手与服务器断开连接，游戏结束");
+            GameInfo1->setText("对局终止");
+            needWarning=false;
+            tcpSocket->disconnectFromHost();
+        }
+        else if(msg[0]==9)
+        {
+            QMessageBox::warning(this,"异常","对局状态异常，游戏强行终止\n"
+                                           "（这可能由网络异常导致）");
+            GameInfo1->setText("对局终止");
+            needWarning=false;
+            tcpSocket->disconnectFromHost();
+        }
+        else if(msg[0]==8)
+        {
+            if(needWaiting)
+            {
+                QTime reachTime=QTime::currentTime().addMSecs(600);
+                while(QTime::currentTime()<=reachTime)
+                    QApplication::processEvents(QEventLoop::AllEvents);
+            }
+            int Black=0,White=0,i,j;
+            if((msg[1]==1&&Color==1)||(msg[1]==2&&Color==-1))
+            {
+                GameInfo1->setText("胜利！");
+                GameInfo2->setText("Winner Winer!\nChicken dinner!");
+            }
+            else
+            {
+                GameInfo1->setText("失败！");
+                GameInfo2->setText("Good luck\nnext time");
+            }
+            for(i=0;i<7;i++)
+                for(j=0;j<7;j++)
+                    if(GridInfo[i][j]==1)
+                    {
+                        Black++;
+                    }
+            for(i=0;i<7;i++)
+                for(j=0;j<7;j++)
+                    if(GridInfo[i][j]==-1)
+                    {
+                        White++;
+                    }
+            blackNum->setText(QString::number(Black));
+            whiteNum->setText(QString::number(White));
+            needWarning=false;
+            tcpSocket->disconnectFromHost();
+        }
+        else if(msg[0]==7)
+        {
+            QString yourColor;
+            turn=1;
+            if(Color==1)
+            {
+                yourColor="黑";
+                SelectStep=1;
+            }
+            else yourColor="白";
+            if(Color==1)
+                GameInfo1->setText("你的回合");
+            else
+                GameInfo1->setText("对手回合");
+            GridInfo[0][0]=GridInfo[6][6]=1;
+            GridInfo[0][6]=GridInfo[6][0]=-1;
+            blackNum->setText("2");
+            whiteNum->setText("2");
+            GridDisplay();
+            QMessageBox::information(this,"对局开始","对局开始！你所执子颜色为"+yourColor);
+        }
+        else
+        {
+            //借用指示AI着法的工具指示对手着法
+            //此处减20的原因为与服务器的数据交换加了20（防止可能的传输0错误）
+            bestStartX=msg[0]-20;
+            bestStartY=msg[1]-20;
+            bestEndX=msg[2]-20;
+            bestEndY=msg[3]-20;
+            SelectX=bestStartX;
+            SelectY=bestStartY;
+            if(turn==1)
+                point[SelectX][SelectY]->setPixmap(QPixmap::fromImage(*AIBlack));
+            if(turn==-1)
+                point[SelectX][SelectY]->setPixmap(QPixmap::fromImage(*AIWhite));
+            point[bestEndX][bestEndY]->setPixmap(QPixmap::fromImage(*AITarget));
+            tm->start(500);
+            needWaiting=true;
+        }
+    }
+    else
+    {
+        char *msg=new char;
+        tcpSocket->read(msg,1);
+        if(*msg==0)
+        {
+            Color=1;
+            GameInfo1->setText(tr("等待对手..."));
+            GameInfo2->setText(tr("PvP 房间号:")+QString::number(roomNumber));
+        }
+        if(*msg==1)
+        {
+            Color=-1;
+            GameInfo2->setText(tr("PvP 房间号:")+QString::number(roomNumber));
+        }
+        if(*msg==2)
+        {
+            QMessageBox::warning(this,tr("进入房间失败"),tr("此房间有正在进行的对局，请重试"));
+            needWarning=false;
+            tcpSocket->disconnectFromHost();
+            GameInfo1->setText("同化鸡");
+        }
+    }
+    }
+}
+
+void MainWindow::slotDisconnect()
+{
+    SelectStep=0;
+    GameMode=0;
+    Color=0;
+    roomNumber=0;
+    turn=0;
+    SelectX=SelectY=-1;
+    if(needWarning)
+    {
+        QMessageBox::information(this,tr("断开连接"),tr("与服务器的连接异常终止，游戏结束"));
+        GameInfo1->setText("对局终止");
+    }
+    else needWarning=true;
+}
+
 void MainWindow::PvE()
 {
     if(GameMode==0||
             QMessageBox::warning(this,tr("警告"),tr("开始新的对局将使当前棋局丢失，确定吗？"),
                                  QMessageBox::Ok|QMessageBox::Cancel,QMessageBox::Cancel)==QMessageBox::Ok)
     {
+
+        if(GameMode==4)
+        {
+            needWarning=false;
+            tcpSocket->disconnectFromHost();
+            GameInfo1->setText("对局终止");
+        }
+        GameMode=0;
+        SelectStep=0;
+        turn=0;
+        SelectX=SelectY=-1;
         QFile::remove("Record.chicken");
+        for(int i=0;i<7;i++)
+            for(int j=0;j<7;j++)
+                GridInfo[i][j]=0;
+        GridDisplay();
+        blackNum->setText("0");
+        whiteNum->setText("0");
+        GameInfo1->setText("同化鸡");
+        GameInfo2->setText("KunerStudio");
         QStringList AIitem;
         AIitem<<tr("人类执黑")<<tr("人类执白");
         bool ok;
@@ -408,15 +669,12 @@ void MainWindow::PvE()
             if(ok)
                 MAX_DEPTH=Dif;
             else MAX_DEPTH=3;
-            turn=1;
-            for(int i=0;i<7;i++)
-                for(int j=0;j<7;j++)
-                    GridInfo[i][j]=0;
             GridInfo[0][0]=GridInfo[6][6]=1;
             GridInfo[0][6]=GridInfo[6][0]=-1;
             GridDisplay();
             blackNum->setText("2");
             whiteNum->setText("2");
+            turn=1;
             GameInfo1->setText("黑方行棋");
             if(choice=="人类执黑")
             {
@@ -543,6 +801,16 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *e)
                     if(inMap(SelectX+i,SelectY+j)&&GridInfo[SelectX+i][SelectY+j]==0)
                         point[SelectX+i][SelectY+j]->setPixmap(QPixmap::fromImage(*empty));
             ProcStep(SelectX,SelectY,x,y);
+            GridDisplay();
+            if(GameMode==4)
+            {
+                char msg[4];
+                msg[0]=SelectX+20;
+                msg[1]=SelectY+20;
+                msg[2]=x+20;
+                msg[3]=y+20;
+                tcpSocket->write(msg,4);
+            }
             SelectX=-1;
             SelectY=-1;
             GridDisplay();
